@@ -1,0 +1,19 @@
+model:
+  default: ling-3.2-air
+  provider: ling-local
+  context_length: 266240
+
+providers:
+  ling-local:
+    name: Ling local
+    api: http://127.0.0.1:8088/v1
+    transport: openai_chat
+    default_model: ling-3.2-air
+    api_key: local-only
+    request_timeout_seconds: 5400
+    stale_timeout_seconds: 5400
+    extra_body:
+      return_progress: true
+
+compression:
+  enabled: false

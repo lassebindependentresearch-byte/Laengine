@@ -1,0 +1,10 @@
+/.llama.cpp/
+/.build/
+/runtime/
+/models/
+*.gguf
+*.safetensors
+*.bin
+*.log
+__pycache__/
+/.venv/

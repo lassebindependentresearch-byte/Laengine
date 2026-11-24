@@ -1,0 +1,468 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 192f706..80a1dd6 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -4386,6 +4386,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.speculative.ngram_simple.size_m = value;
+         }
+     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--spec-ngram-simple-prompt-only"},
++        "draft only from the input prompt and prefer the longest matching suffix",
++        [](common_params & params) {
++            params.speculative.ngram_simple_prompt_only = true;
++        }
++    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+     add_opt(common_arg(
+         {"--spec-ngram-simple-min-hits"}, "N",
+         string_format("minimum hits for ngram-simple speculative decoding (default: %d)", params.speculative.ngram_simple.min_hits),
+diff --git a/common/common.h b/common/common.h
+index 9b9e892..597b89c 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -401,6 +401,7 @@ struct common_params_speculative {
+ 
+     common_params_speculative_ngram_mod ngram_mod;
+     common_params_speculative_ngram_map ngram_simple;
++    bool ngram_simple_prompt_only = false;
+     common_params_speculative_ngram_map ngram_map_k;
+     common_params_speculative_ngram_map ngram_map_k4v;
+ 
+diff --git a/common/ngram-map.cpp b/common/ngram-map.cpp
+index d1cb451..5afac6d 100644
+--- a/common/ngram-map.cpp
++++ b/common/ngram-map.cpp
+@@ -112,6 +112,43 @@ llama_tokens common_ngram_simple_draft(
+ }
+ 
+ 
++llama_tokens common_ngram_prompt_draft(
++        const common_ngram_simple_config & config, const llama_tokens & source,
++        const llama_tokens & history, llama_token sampled) {
++    const size_t min_match = config.size_ngram;
++    if (source.size() <= min_match || history.size() + 1 < min_match) {
++        return {};
++    }
++
++    constexpr size_t max_lookback = 256;
++    const size_t lookback = std::min(std::max(min_match, max_lookback), history.size() + 1);
++    size_t best_match = min_match - 1;
++    size_t copy_start = 0;
++    for (size_t end = min_match - 1; end < source.size() - min_match; ++end) {
++        if (source[end] != sampled) {
++            continue;
++        }
++        size_t match = 1;
++        while (match <= end && match < lookback && source[end - match] == history[history.size() - match]) {
++            ++match;
++        }
++        if (match > best_match) {
++            best_match = match;
++            copy_start = end + 1;
++            if (match == lookback) {
++                break;
++            }
++        }
++    }
++    if (copy_start == 0) {
++        return {};
++    }
++
++    const size_t count = std::min<size_t>(config.size_mgram, source.size() - copy_start);
++    return llama_tokens(source.begin() + copy_start, source.begin() + copy_start + count);
++}
++
++
+ // n-gram map
+ //
+ 
+diff --git a/common/ngram-map.h b/common/ngram-map.h
+index 97608ef..85c3f8f 100644
+--- a/common/ngram-map.h
++++ b/common/ngram-map.h
+@@ -31,6 +31,10 @@ llama_tokens common_ngram_simple_draft(
+         const common_ngram_simple_config & config,
+         const llama_tokens & tokens, llama_token sampled);
+ 
++llama_tokens common_ngram_prompt_draft(
++        const common_ngram_simple_config & config, const llama_tokens & source,
++        const llama_tokens & history, llama_token sampled);
++
+ 
+ // n-gram map
+ //
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index b40eb55..5ea54c3 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -2328,6 +2328,7 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+ 
+     // shared across all sequences
+     common_ngram_simple_config config;
++    std::vector<llama_tokens> sources;
+ 
+     common_speculative_impl_ngram_simple(
+             const common_params_speculative & params, uint32_t n_seq,
+@@ -2335,14 +2336,17 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, n_seq, params.ngram_simple.size_m)
+         , params(params.ngram_simple)
+         , config(config)
++        , sources(params.ngram_simple_prompt_only ? n_seq : 0)
+     {
+         SPC_TRC("%s", "adding speculative implementation 'ngram-simple'\n");
+         SPC_TRC("- size_n=%d, size_m=%d, min_hits=%d\n",
+                 this->params.size_n, this->params.size_m, this->params.min_hits);
+     }
+ 
+-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
+-        // noop
++    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        if (!sources.empty()) {
++            sources[seq_id] = prompt;
++        }
+     }
+ 
+     bool process(const common_batch & /*batch*/) override {
+@@ -2359,7 +2363,11 @@ struct common_speculative_impl_ngram_simple : public common_speculative_impl {
+                 continue;
+             }
+ 
+-            *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
++            if (sources.empty()) {
++                *dp.result = common_ngram_simple_draft(config, *dp.prompt, dp.id_last);
++            } else {
++                *dp.result = common_ngram_prompt_draft(config, sources[seq_id], *dp.prompt, dp.id_last);
++            }
+         }
+     }
+ 
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index c7959a4..8b3ed72 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8667,7 +8667,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     uint32_t workgroups_y = (uint32_t)neq2;
+     uint32_t workgroups_z = (uint32_t)neq3;
+ 
+-    const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
++    const bool ling_mla = HSK == 576 && HSV == 512 && qk_ratio == 32 &&
++        ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->uma;
++    static const bool ling_mla_fp16_verify = getenv("LING_MLA_FP16_VERIFY") != nullptr;
++    const bool use_mla_fp16_verify = ling_mla_fp16_verify && ling_mla && N >= 5 && N <= 8 && KV >= 16384 &&
++        ctx->device->coopmat_support_16x16x16_f16acc && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
++    const bool f32acc = !ctx->device->fp16 || (!use_mla_fp16_verify && !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst))) ||
++        k->type == GGML_TYPE_BF16;
+ 
+     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+     auto is_dense_kv_cache = [](const ggml_tensor * t) {
+@@ -8710,21 +8716,34 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     const ggml_type k_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : k->type;
+     const ggml_type v_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : v->type;
+ 
++    static const char * mla_group_queries_value = getenv("GGML_VK_MLA_GROUP_QUERIES");
++    static const uint32_t mla_group_queries = mla_group_queries_value ? std::max(0, atoi(mla_group_queries_value)) : 0;
++    const bool use_mla_groups = ling_mla && N <= mla_group_queries;
++
+     // N=32 avoids the cm1 prefill block_rows doubling
+     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 32, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
+     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
+-
+-    if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
++    uint32_t group = qk_ratio;
++    if (use_mla_groups) {
++        while (group > max_gqa && group > 1) {
++            group /= 2;
++        }
++    }
++    if ((N <= 8 || use_mla_groups) && group > 1 && group <= max_gqa &&
+         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
+-        // grouped query attention - make the N dimension equal to gqa_ratio, reduce
+-        // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
+-        // and change addressing calculations to index Q's dimension 2.
+-        gqa_ratio = qk_ratio;
++        // Each workgroup covers consecutive query heads belonging to the same K/V head.
++        gqa_ratio = group;
+         N = gqa_ratio;
+         workgroups_y /= gqa_ratio;
+     }
+ 
+     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc, qk_ratio);
++    static const bool mla_wave32 = getenv("GGML_VK_MLA_WAVE32") != nullptr;
++    if (mla_wave32 && use_mla_groups && gqa_ratio > 1 && tuning_params.path == FA_COOPMAT1 &&
++        ctx->device->subgroup_size_control && ctx->device->subgroup_min_size <= 32 && ctx->device->subgroup_max_size >= 32) {
++        tuning_params.subgroup_size = 32;
++        tuning_params.workgroup_size = tuning_params.row_split * 32;
++    }
+ 
+     float scale         = 1.0f;
+     float max_bias      = 0.0f;
+@@ -8809,7 +8828,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+     }
+ 
+     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
+-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
++    static const bool mla_mask_opt = getenv("GGML_VK_MLA_MASK_OPT") != nullptr;
++    // Each grouped-query tile shares one mask row for all heads.
++    const bool use_mla_mask_opt = mla_mask_opt && use_mla_groups && gqa_ratio > 1 &&
++        tuning_params.path == FA_COOPMAT1 && nem0 >= 16384 && nem2 == 1 && nem3 == 1;
++    bool use_mask_opt = mask && !use_sparse && ((gqa_ratio == 1 && nem1 >= 32) || use_mla_mask_opt) &&
++                        nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
+     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
+                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+@@ -8984,19 +9008,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+         ggml_vk_preallocate_buffers(ctx, subctx);
+     }
+ 
++    const uint32_t mask_opt_rows = use_mla_mask_opt ? 1 : Br;
+     const uint32_t mask_opt_num_dwords = CEIL_DIV(nem0, 16 * Bc);
+-    const uint64_t mask_opt_size = sizeof(uint32_t) * mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2 * nem3;
++    const uint32_t mask_opt_tiles_y = CEIL_DIV(nem1, mask_opt_rows);
++    const uint64_t mask_opt_size = sizeof(uint32_t) * mask_opt_num_dwords * mask_opt_tiles_y * nem2 * nem3;
+ 
+     vk_pipeline pipeline_fa_mask_opt = nullptr;
+     if (use_mask_opt) {
+         {
+             std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+             auto &pipelines = ctx->device->pipeline_fa_mask_opt;
+-            auto it = pipelines.find({Br, Bc});
++            auto it = pipelines.find({mask_opt_rows, Bc});
+             if (it != pipelines.end()) {
+                 pipeline_fa_mask_opt = it->second;
+             } else {
+-                pipelines[{Br, Bc}] = pipeline_fa_mask_opt = std::make_shared<vk_pipeline_struct>();
++                pipelines[{mask_opt_rows, Bc}] = pipeline_fa_mask_opt = std::make_shared<vk_pipeline_struct>();
+             }
+         }
+         assert(pipeline_fa_mask_opt);
+@@ -9116,13 +9142,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
+             (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
+             (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
+             mask_opt_num_dwords,
+-            mask_opt_num_dwords * CEIL_DIV(nem1, Br),
+-            mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2,
++            mask_opt_num_dwords * mask_opt_tiles_y,
++            mask_opt_num_dwords * mask_opt_tiles_y * nem2,
+         };
+ 
+         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
+                                   { mask_buf, mask_opt_buf }, opt_pc,
+-                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
++                                  { mask_opt_num_dwords, mask_opt_tiles_y, nem2 * nem3 });
+         ggml_vk_sync_buffers(ctx, subctx);
+     }
+ 
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+index bb9755a..585d657 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp
+@@ -198,7 +198,7 @@ void main() {
+ 
+     const uint32_t mo_stride = CEIL_DIV(KV, 16 * Bc);
+     // mo_offset will point to the tile starting at row i*Br and col 0
+-    uint32_t mo_offset = mo_stride * i;
++    uint32_t mo_offset = mo_stride * (p.gqa_ratio > 1 ? gqa_iq1 : i);
+ 
+     // FaBlockBytesK/V == 2 for f16 (sizeof f16) and == 16 for f32 (vec4) and == ggml block size for quants.
+     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / FaBlockBytesK;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 728473f..123fbaf 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3316,6 +3316,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+ 
+                 const bool mtp_on_hybrid_nemotron =
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
++                static const char * ling_mtp_window_value = getenv("LING_MTP_WINDOW");
++                static const uint32_t ling_mtp_window = ling_mtp_window_value ?
++                    std::max(0, atoi(ling_mtp_window_value)) : 0;
++                const bool ling_mtp_swa = mtp_on_hybrid_qwen && arch == LLM_ARCH_BAILINGMOE3 && ling_mtp_window > 0;
+ 
+                 if (llm_arch_is_recurrent(arch)) {
+                     res = new llama_memory_recurrent(
+@@ -3535,8 +3539,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                 cparams.kv_unified,
+                                 cparams.n_ctx_seq,
+                                 cparams.n_seq_max,
+-                                hparams.n_swa,
+-                                hparams.swa_type,
++                                ling_mtp_swa ? ling_mtp_window : hparams.n_swa,
++                                ling_mtp_swa ? LLAMA_SWA_TYPE_STANDARD : hparams.swa_type,
+                                 nullptr,
+                                 filter,
+                                 nullptr,
+diff --git a/src/models/bailingmoe3.cpp b/src/models/bailingmoe3.cpp
+index ad1f0ee..5a26f9e 100644
+--- a/src/models/bailingmoe3.cpp
++++ b/src/models/bailingmoe3.cpp
+@@ -74,16 +74,27 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", il), { n_embd }, trunk_flags);
+ 
+         if (hparams.is_recr(il)) {
+-            layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
+-            layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
+-            layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
++            layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { d_conv, 3 * d_inner },
++                    trunk_flags | TENSOR_NOT_REQUIRED);
++            if (layer.ssm_conv1d == nullptr) {
++                layer.ssm_q_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_Q, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
++                layer.ssm_k_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_K, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
++                layer.ssm_v_conv = create_tensor(tn(LLM_TENSOR_SSM_CONV1D_V, "weight", il), { d_conv, 1, d_inner, 1 }, trunk_flags);
++            }
+ 
+-            create_tensor_qkv(layer, il, n_embd, d_inner, d_inner, d_inner, trunk_flags);
+-            layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", il), { n_embd, d_inner }, trunk_flags);
++            layer.ssm_in = create_tensor(tn(LLM_TENSOR_SSM_IN, "weight", il), { n_embd, 5 * d_inner },
++                    trunk_flags | TENSOR_NOT_REQUIRED);
++            if (layer.ssm_conv1d != nullptr && layer.ssm_in == nullptr) {
++                throw std::runtime_error("BailingMoE3 packed convolution requires packed projections");
++            }
++            if (layer.ssm_in == nullptr) {
++                create_tensor_qkv(layer, il, n_embd, d_inner, d_inner, d_inner, trunk_flags);
++                layer.ssm_f_a = create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", il), { n_embd, d_inner }, trunk_flags);
++                layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", il), { n_embd, d_inner }, trunk_flags);
++            }
+             layer.ssm_beta = create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", il), { n_embd, n_head }, trunk_flags);
+             layer.ssm_a = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN, il), { 1, n_head }, trunk_flags);
+             layer.ssm_dt_b = create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", il), { d_inner }, trunk_flags);
+-            layer.ssm_g_a = create_tensor(tn(LLM_TENSOR_SSM_G_A, "weight", il), { n_embd, d_inner }, trunk_flags);
+             layer.ssm_o_norm = create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", il), { head_dim }, trunk_flags);
+             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { d_inner, n_embd }, trunk_flags);
+         } else {
+@@ -162,7 +173,7 @@ std::unique_ptr<llm_graph_context> llama_model_bailingmoe3::build_arch_graph(con
+ 
+ ggml_tensor * llama_model_bailingmoe3::graph::build_causal_conv1d(
+         llm_graph_input_rs * inp_rs, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
+-        int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
++        int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w,
+         int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs) {
+     const int64_t d_inner = head_dim * n_head;
+     const int64_t conv_state_size = (d_conv - 1) * d_inner;
+@@ -173,8 +184,8 @@ ggml_tensor * llama_model_bailingmoe3::graph::build_causal_conv1d(
+             total_state_size * ggml_element_size(conv_state_all),
+             qkv * conv_state_size * ggml_element_size(conv_state_all));
+ 
+-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
+-    x_proj = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
++    x_proj = ggml_view_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs,
++            x_proj->nb[1], x_proj->nb[1] * n_seq_tokens, 0);
+     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state, ggml_transpose(ctx0, x_proj), 0);
+ 
+     build_conv_state_store(inp_rs, conv_states_all, conv_x, d_conv - 1,
+@@ -229,17 +240,45 @@ llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
+             ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+             ggml_tensor * conv_state_all = build_rs(inp_rs, conv_states_all, hparams.n_embd_r(), n_seqs);
+ 
+-            ggml_tensor * q = build_causal_conv1d(
+-                    inp_rs, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv,
+-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+-            ggml_tensor * k = build_causal_conv1d(
+-                    inp_rs, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv,
+-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+-            ggml_tensor * v = build_causal_conv1d(
+-                    inp_rs, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv,
+-                    d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
+-
+-            ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ssm_f_a, cur);
++            ggml_tensor * packed = layer.ssm_in ? ggml_mul_mat(ctx0, layer.ssm_in, cur) : nullptr;
++            const auto project = [&](ggml_tensor * weight, int index) {
++                return packed ? ggml_view_2d(ctx0, packed, d_inner, n_tokens, packed->nb[1], index * d_inner * packed->nb[0])
++                              : ggml_mul_mat(ctx0, weight, cur);
++            };
++
++            ggml_tensor * q;
++            ggml_tensor * k;
++            ggml_tensor * v;
++            if (layer.ssm_conv1d != nullptr && packed != nullptr) {
++                ggml_tensor * previous = ggml_reshape_3d(ctx0, conv_state_all, d_conv - 1, 3 * d_inner, n_seqs);
++                ggml_tensor * qkv = ggml_view_3d(ctx0, packed, 3 * d_inner, n_seq_tokens, n_seqs,
++                        packed->nb[1], packed->nb[1] * n_seq_tokens, 0);
++                ggml_tensor * input = ggml_concat(ctx0, previous, ggml_transpose(ctx0, qkv), 0);
++                build_conv_state_store(inp_rs, conv_states_all, input, d_conv - 1, 0);
++
++                ggml_tensor * out = ggml_ssm_conv(ctx0, input, layer.ssm_conv1d);
++                out = ggml_silu(ctx0, ggml_reshape_2d(ctx0, out, 3 * d_inner, n_tokens));
++                const auto conv_slice = [&](int index) {
++                    return ggml_view_4d(ctx0, out, head_dim, n_head, n_seq_tokens, n_seqs,
++                            head_dim * out->nb[0], out->nb[1], out->nb[1] * n_seq_tokens,
++                            index * d_inner * out->nb[0]);
++                };
++                q = conv_slice(0);
++                k = conv_slice(1);
++                v = conv_slice(2);
++            } else {
++                q = build_causal_conv1d(
++                        inp_rs, conv_states_all, conv_state_all, 0, project(layer.wq, 0), layer.ssm_q_conv,
++                        d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
++                k = build_causal_conv1d(
++                        inp_rs, conv_states_all, conv_state_all, 1, project(layer.wk, 1), layer.ssm_k_conv,
++                        d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
++                v = build_causal_conv1d(
++                        inp_rs, conv_states_all, conv_state_all, 2, project(layer.wv, 2), layer.ssm_v_conv,
++                        d_conv, head_dim, n_head, n_seq_tokens, n_seqs);
++            }
++
++            ggml_tensor * gate = project(layer.ssm_f_a, 3);
+             gate = ggml_add(ctx0, gate, layer.ssm_dt_b);
+             gate = ggml_reshape_3d(ctx0, gate, head_dim, n_head, n_tokens);
+             ggml_tensor * a = ggml_reshape_3d(ctx0, layer.ssm_a, 1, n_head, 1);
+@@ -260,8 +299,9 @@ llama_model_bailingmoe3::graph::graph(const llm_graph_params & params) :
+             ggml_tensor * out = ggml_cont(ctx0, build_recurrent_attn(
+                     inp_rs, states_all, q, k, v, gate, beta, state, il));
+ 
+-            ggml_tensor * out_gate = ggml_mul_mat(ctx0, layer.ssm_g_a, cur);
+-            out_gate = ggml_reshape_3d(ctx0, out_gate, head_dim, n_head, n_tokens);
++            ggml_tensor * out_gate = project(layer.ssm_g_a, 4);
++            out_gate = ggml_view_3d(ctx0, out_gate, head_dim, n_head, n_tokens,
++                    head_dim * out_gate->nb[0], out_gate->nb[1], 0);
+             out = ggml_reshape_3d(ctx0, out, head_dim, n_head, n_tokens);
+             out = build_norm(out, layer.ssm_o_norm, nullptr, LLM_NORM_RMS, il);
+             out = ggml_mul(ctx0, out, ggml_sigmoid(ctx0, out_gate));
+diff --git a/src/models/models.h b/src/models/models.h
+index 8da3bcf..82974c1 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2182,7 +2182,7 @@ struct llama_model_bailingmoe3 : public llama_model_base {
+ 
+         // causal conv1d over one of Q/K/V, qkv selects which third of the conv state row is used
+         ggml_tensor * build_causal_conv1d(llm_graph_input_rs * inp_rs, ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
+-                                          int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
++                                          int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w,
+                                           int64_t d_conv, int64_t head_dim, int64_t n_head, int64_t n_seq_tokens, int64_t n_seqs);
+     };
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 0cdc022..9deb4e2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -46,6 +46,12 @@
+ 
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++static llama_state_seq_flags spec_target_checkpoint_flags(const common_params & params) {
++    static const bool on_device = getenv("LING_SPEC_DEVICE_CHECKPOINT") != nullptr;
++    const bool use_device = on_device && params.n_parallel == 1 && params.speculative.ngram_simple_prompt_only;
++    return LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | (use_device ? LLAMA_STATE_SEQ_FLAGS_ON_DEVICE : 0);
++}
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (!params.mmproj.path.empty()) {
+         const auto mcaps = mtmd_get_cap_from_file(params.mmproj.path.c_str());
+@@ -3903,7 +3909,7 @@ private:
+                 if (use_ckpt_tgt) {
+                     //const int64_t t_start = ggml_time_us();
+ 
+-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++                    ckpt.update_tgt(ctx_tgt, slot.id, spec_target_checkpoint_flags(params_base));
+ 
+                     //const int64_t t_total = ggml_time_us() - t_start;
+                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
+@@ -4911,7 +4917,7 @@ private:
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
+-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
++                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, spec_target_checkpoint_flags(params_base)));
+ 
+                         if (slot.ctx_dft) {
+                             GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
